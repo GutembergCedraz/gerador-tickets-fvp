@@ -538,15 +538,24 @@ function processar({ cabecalho, linhas }, modulos, cicloManual = "") {
     !(temFornecedor && (r[COL_FORNECEDOR] || "").trim().toLowerCase() === "sim")
   );
 
-  const tickets = filtradas.map(r => ({
-    "orgid": r[COL.orgid],
-    "Instituição": r[COL.instituicao],
-    "Marca": r[COL.marca],
-    "AS ID": r[COL.asid],
-    "Segmento": r[COL.segmento],
-    "Módulo": r[COL.teste],
-    "Mensagem": montarMensagem(r, cicloManual || r[COL.ciclo])
-  }));
+  // Um ticket por servidor (instituição + AS ID), segmento e módulo. Linhas que só diferem em
+  // colunas que não entram na mensagem (ex.: Subproduto "-" e "JSR" do enrollments) viram um só.
+  const ticketPorChave = new Map();
+  for (const r of filtradas) {
+    const k = [chave(r[COL.instituicao]), chave(r[COL.asid]), chave(r[COL.segmento]), moduloDaLinha(r)].join("|");
+    if (ticketPorChave.has(k)) continue;
+    ticketPorChave.set(k, {
+      "orgid": r[COL.orgid],
+      "Instituição": r[COL.instituicao],
+      "Marca": r[COL.marca],
+      "AS ID": r[COL.asid],
+      "Segmento": r[COL.segmento],
+      "Módulo": r[COL.teste],
+      "Mensagem": montarMensagem(r, cicloManual || r[COL.ciclo])
+    });
+  }
+  const tickets = [...ticketPorChave.values()];
+  const unificadas = filtradas.length - tickets.length;
 
   // Avisos para conferência (não bloqueiam a geração)
   const avisos = [];
@@ -564,17 +573,11 @@ function processar({ cabecalho, linhas }, modulos, cicloManual = "") {
   }
   const semInst = filtradas.filter(r => !r[COL.instituicao]).length;
   if (semInst) avisos.push(`${plural(semInst, "ticket está", "tickets estão")} com a coluna "Instituição" vazia.`);
-  const vistos = new Set(); let duplicados = 0;
-  for (const t of tickets) {
-    const k = [t["Instituição"], t["AS ID"], t["Segmento"], t["Módulo"]].join("|");
-    if (vistos.has(k)) duplicados++; else vistos.add(k);
-  }
-  if (duplicados) avisos.push(`${plural(duplicados, "ticket repetido", "tickets repetidos")} (mesma instituição, AS ID, segmento e módulo). Confira se a base tem linhas duplicadas.`);
   const naoEncontrados = modulos.filter(m => linhasPorModulo.get(m) === 0);
   if (naoEncontrados.length) avisos.push(`Módulos da lista que não aparecem em nenhuma linha da base (confira se o nome está certo):\n  • ${naoEncontrados.join("\n  • ")}`);
 
   const nenhumModuloEncontrado = naoEncontrados.length === modulos.length;
-  return { total: linhas.length, filtradas, tickets, contagemStatus, avisos, nenhumModuloEncontrado };
+  return { total: linhas.length, filtradas, tickets, unificadas, contagemStatus, avisos, nenhumModuloEncontrado };
 }
 
 // =========================
@@ -779,7 +782,9 @@ function renderizarResultado(r) {
     $("stats").appendChild(d);
   });
   $("statusLista").textContent = "Status na base: " +
-    Object.entries(r.contagemStatus).sort((a, b) => b[1] - a[1]).map(([s, n]) => `${s} (${n.toLocaleString("pt-BR")})`).join(" · ");
+    Object.entries(r.contagemStatus).sort((a, b) => b[1] - a[1]).map(([s, n]) => `${s} (${n.toLocaleString("pt-BR")})`).join(" · ") +
+    (r.unificadas ? `. ${plural(r.unificadas, "linha repetida foi unificada", "linhas repetidas foram unificadas")} ` +
+                    "(mesmo servidor, segmento e módulo — ex.: Subproduto \"-\" e \"JSR\"): um ticket por módulo." : "");
 
   $("avisos").innerHTML = "";
   r.avisos.forEach(a => {
