@@ -331,6 +331,20 @@ function chave(s) {
     .replace(/[\s ]+/g, " ").trim().toLowerCase();
 }
 
+// Núcleo do nome de um módulo: sem o prefixo "fvp", o sufixo "_test-module", a versão e
+// trocando "-" por "_". Assim os dois formatos de base apontam para o mesmo módulo:
+// "fvp-enrollments_api_payments-core_open_test-module_v2-2" -> "enrollments_api_payments_core"
+// "enrollments_api_payments_core"                           -> "enrollments_api_payments_core"
+function nucleoModulo(s) {
+  return chave(s).replace(/[-\s]/g, "_").replace(/^fvp_/, "")
+    .replace(/(_open)?_test_module(_v\d+(_\d+)*)?$/, "");
+}
+
+// "Outubro-2026", "outubro/26" e "Outubro 26" são o mesmo ciclo
+function chaveCiclo(s) {
+  return chave(s).replace(/[^a-z0-9]/g, "").replace(/20(\d{2})$/, "$1");
+}
+
 function normalizarStatus(s) {
   // Remove símbolos do status (ex.: "✖ FALHA" -> "FALHA")
   return s.replace(/[^\p{L}\p{N}_\s]/gu, "").replace(/\s+/g, " ").toUpperCase().trim();
@@ -496,20 +510,30 @@ function processar({ cabecalho, linhas }, modulos, cicloManual = "") {
   }
 
   const contagemStatus = {};
-  const linhasPorModulo = new Map(modulos.map(m => [chave(m), 0]));
   for (const r of linhas) {
     for (const c of COLUNAS_OBRIGATORIAS) r[c] = (r[c] || "").trim();
     if (r[COL.segmento] === "" || r[COL.segmento].toUpperCase() === "NULL") r[COL.segmento] = "Não informado";
     r[COL.status] = normalizarStatus(r[COL.status]);
     const s = r[COL.status] || "(vazio)";
     contagemStatus[s] = (contagemStatus[s] || 0) + 1;
-    const k = chave(r[COL.teste]);
-    if (linhasPorModulo.has(k)) linhasPorModulo.set(k, linhasPorModulo.get(k) + 1);
+  }
+
+  // A qual módulo da lista cada linha pertence. Primeiro pelo nome exato; se o módulo não
+  // aparece com o nome exato na base, pelo núcleo do nome (a base de outubro/2026 passou a
+  // trazer nomes abreviados, ex.: "customer_data_unique_happy_path").
+  const porNome = new Map(modulos.map(m => [chave(m), m]));
+  const nomesNaBase = new Set(linhas.map(r => chave(r[COL.teste])));
+  const porNucleo = new Map(modulos.filter(m => !nomesNaBase.has(chave(m))).map(m => [nucleoModulo(m), m]));
+  const moduloDaLinha = r => porNome.get(chave(r[COL.teste])) ?? porNucleo.get(nucleoModulo(r[COL.teste]));
+  const linhasPorModulo = new Map(modulos.map(m => [m, 0]));
+  for (const r of linhas) {
+    const m = moduloDaLinha(r);
+    if (m !== undefined) linhasPorModulo.set(m, linhasPorModulo.get(m) + 1);
   }
 
   const temFornecedor = cabecalho.includes(COL_FORNECEDOR);
   const filtradas = linhas.filter(r =>
-    linhasPorModulo.has(chave(r[COL.teste])) &&
+    moduloDaLinha(r) !== undefined &&
     STATUS_CONSIDERADOS.has(chave(r[COL.status]).toUpperCase()) &&
     !(temFornecedor && (r[COL_FORNECEDOR] || "").trim().toLowerCase() === "sim")
   );
@@ -529,7 +553,7 @@ function processar({ cabecalho, linhas }, modulos, cicloManual = "") {
   if (cicloManual) {
     // Ajuda a pegar um ciclo digitado errado (ex.: base de agosto com "setembro" no campo)
     const ciclosBase = [...new Set(filtradas.map(r => r[COL.ciclo]).filter(Boolean))];
-    if (ciclosBase.length && !ciclosBase.some(c => chave(c) === chave(cicloManual))) {
+    if (ciclosBase.length && !ciclosBase.some(c => chaveCiclo(c) === chaveCiclo(cicloManual))) {
       avisos.push(`O ciclo digitado ("${cicloManual}") é diferente do que está na coluna Ciclo da base ` +
                   `(${ciclosBase.slice(0, 3).map(c => `"${c}"`).join(", ")}${ciclosBase.length > 3 ? "..." : ""}). ` +
                   "As mensagens usam o ciclo digitado. Confira se está certo.");
@@ -546,10 +570,11 @@ function processar({ cabecalho, linhas }, modulos, cicloManual = "") {
     if (vistos.has(k)) duplicados++; else vistos.add(k);
   }
   if (duplicados) avisos.push(`${plural(duplicados, "ticket repetido", "tickets repetidos")} (mesma instituição, AS ID, segmento e módulo). Confira se a base tem linhas duplicadas.`);
-  const naoEncontrados = modulos.filter(m => linhasPorModulo.get(chave(m)) === 0);
+  const naoEncontrados = modulos.filter(m => linhasPorModulo.get(m) === 0);
   if (naoEncontrados.length) avisos.push(`Módulos da lista que não aparecem em nenhuma linha da base (confira se o nome está certo):\n  • ${naoEncontrados.join("\n  • ")}`);
 
-  return { total: linhas.length, filtradas, tickets, contagemStatus, avisos };
+  const nenhumModuloEncontrado = naoEncontrados.length === modulos.length;
+  return { total: linhas.length, filtradas, tickets, contagemStatus, avisos, nenhumModuloEncontrado };
 }
 
 // =========================
@@ -712,9 +737,12 @@ $("btnGerar").onclick = async () => {
     renderizarResultado(r);
 
     if (!r.tickets.length) {
-      mostrarMensagem("warn",
-        "Nenhum ticket foi gerado — nenhuma linha tem os módulos da lista com status FALHA ou NÃO EXECUTADO.\n" +
-        "Nenhum arquivo foi baixado. Confira o resumo abaixo.");
+      mostrarMensagem("warn", r.nenhumModuloEncontrado
+        ? "Nenhum ticket foi gerado: nenhum dos módulos da lista aparece na base.\n" +
+          "Confira os nomes no passo 3 (Módulos de interesse) e compare com a coluna \"Nome do Teste\" da base.\n" +
+          "Nenhum arquivo foi baixado."
+        : "Nenhum ticket foi gerado — nenhuma linha tem os módulos da lista com status FALHA ou NÃO EXECUTADO.\n" +
+          "Nenhum arquivo foi baixado. Confira o resumo abaixo.");
       return;
     }
 
